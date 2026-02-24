@@ -1,0 +1,42 @@
+# =============================================================================
+# pytest-mock==3.12.0
+# pytest-cov==4.1.0
+# pytest-asyncio==0.23.3
+# pytest==7.4.4
+# Testing (use only during development)
+
+# prometheus-client==0.19.0
+# Prometheus (metrics) - not needed for POC
+
+# opentelemetry-exporter-otlp==1.22.0
+# opentelemetry-instrumentation-fastapi==0.43b0
+# opentelemetry-sdk==1.22.0
+# opentelemetry-api==1.22.0
+# OpenTelemetry (tracing) - adds ~500MB to image
+# =============================================================================
+# REMOVED FOR POC (uncomment if needed for production):
+# =============================================================================
+
+python-json-logger==2.0.7
+# Logging (lightweight)
+
+jsonschema==4.21.0
+# JSON Schema Validation
+
+openai==1.10.0
+# OpenAI-compatible client (for Ollama)
+
+httpx==0.26.0
+# HTTP Client
+
+pydantic-settings==2.1.0
+pydantic==2.5.3
+# Data Validation
+
+uvicorn[standard]==0.27.0
+fastapi==0.109.0
+# Web Framework
+
+# =============================================================================
+# MINIMAL POC DEPENDENCIES - Essential packages only
+

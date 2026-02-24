@@ -1,0 +1,67 @@
+# =============================================================================
+# MINIMAL OPTIMIZED DOCKERFILE - Reduces image size from 4GB to ~1.5GB
+# Key optimizations:
+# 1. Use slim Python base (not pytorch/pytorch which includes CUDA)
+# 2. CPU-only PyTorch (much smaller than CUDA version)
+# 3. Multi-stage build to separate dependencies
+# 4. Pre-cache model in build stage
+# =============================================================================
+
+# Stage 1: Build stage - download model and prepare dependencies
+FROM python:3.10-slim as builder
+
+WORKDIR /build
+
+# Install minimal build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python packages
+RUN pip install --no-cache-dir --target=/build/packages \
+    fastapi==0.109.0 \
+    uvicorn[standard]==0.27.0 \
+    pydantic==2.5.3 \
+    sentence-transformers==2.5.1 \
+    faiss-cpu==1.7.4 \
+    numpy==1.26.3 \
+    torch==2.2.0 --index-url https://download.pytorch.org/whl/cpu
+
+# Pre-download the embedding model (this gets cached in the layer)
+ENV TRANSFORMERS_CACHE=/build/model_cache
+ENV SENTENCE_TRANSFORMERS_HOME=/build/model_cache
+RUN python -c "import sys; sys.path.insert(0, '/build/packages'); \
+    from sentence_transformers import SentenceTransformer; \
+    print('Downloading model...'); \
+    SentenceTransformer('BAAI/bge-small-en-v1.5'); \
+    print('Model cached successfully!')"
+
+# Stage 2: Runtime stage - minimal runtime image
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install only runtime essentials
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed packages from builder
+COPY --from=builder /build/packages /usr/local/lib/python3.10/site-packages/
+
+# Copy cached model from builder
+ENV TRANSFORMERS_CACHE=/app/model_cache
+ENV SENTENCE_TRANSFORMERS_HOME=/app/model_cache
+COPY --from=builder /build/model_cache /app/model_cache
+
+# Copy application code
+COPY src/ /app/src/
+
+EXPOSE 9001
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD curl -f http://localhost:9001/health || exit 1
+
+# Run with minimal workers for faster startup
+CMD ["uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "9001", "--workers", "1"]
+

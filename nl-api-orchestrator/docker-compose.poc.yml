@@ -1,0 +1,187 @@
+# =============================================================================
+# MINIMAL POC DOCKER COMPOSE - Fast startup, essential services only
+# =============================================================================
+# This is a simplified version with:
+# - Ollama LLM (local model)
+# - Orchestrator (main service)
+# - MCP API Tools (tool execution)
+# - MCP Embed (RAG embeddings)
+# - OPA Policy (security)
+#
+# REMOVED for POC:
+# - Traefik (use direct connections)
+# - OpenTelemetry/Jaeger (no tracing)
+# - Prometheus (no metrics)
+# - Grafana (no dashboards)
+# - Loki/Promtail (no log aggregation)
+# =============================================================================
+
+services:
+  # =============================================================================
+  # Main Orchestrator Service - Core brain of the system
+  # =============================================================================
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile.poc  # Minimal dependencies
+    ports:
+      - "8080:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LLM_PROVIDER=ollama
+      - LLM_BASE_URL=http://ollama:11434
+      - MODEL_NAME=llama3.1:8b
+      - EMBED_SERVER_URL=http://mcp-embed:9001
+      - API_TOOLS_URL=http://mcp-api:9000
+      - OPA_URL=http://mcp-policy:8181/v1/data/policy
+      - LOG_LEVEL=INFO
+      # Disable monitoring features
+      - ENABLE_TRACING=false
+      - ENABLE_METRICS=false
+    volumes:
+      - ./orchestrator/registry:/app/registry:ro
+      - ./orchestrator/src:/app/src:ro
+    depends_on:
+      - ollama
+      - mcp-embed
+      - mcp-api
+      - mcp-policy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - nl-api-net
+
+  # =============================================================================
+  # Ollama - Local LLM Server
+  # Fast startup, manages models automatically
+  # =============================================================================
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    # GPU support (comment out if no GPU available - will use CPU)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - nl-api-net
+
+  # =============================================================================
+  # MCP Embeddings Server - RAG capability matching
+  # Generates embeddings for semantic search
+  # OPTIMIZED: CPU-only PyTorch, pre-downloaded model
+  # Build time: ~3min first time, ~30sec rebuilds (with cache)
+  # Image size: ~1.5-2GB (vs 4GB+ with CUDA)
+  # =============================================================================
+  mcp-embed:
+    build:
+      context: ./mcp/embed_tools
+      dockerfile: Dockerfile.fast  # CPU-only, optimized for size and speed
+    ports:
+      - "9001:9001"
+    environment:
+      - EMBED_MODEL=BAAI/bge-small-en-v1.5
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+      # Disable unnecessary logging for faster startup
+      - TRANSFORMERS_VERBOSITY=error
+      - TOKENIZERS_PARALLELISM=false
+    volumes:
+      - ./orchestrator/registry:/app/registry:ro
+      - embed-cache:/root/.cache  # Persists model cache across restarts
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - nl-api-net
+
+  # =============================================================================
+  # MCP API Tools Server - Executes API calls
+  # Implements MCP protocol for tool execution
+  # =============================================================================
+  mcp-api:
+    build:
+      context: ./mcp/api_tools
+      dockerfile: Dockerfile.poc  # Minimal dependencies
+    ports:
+      - "9090:9090"
+    environment:
+      - API_TOKEN=demo-token
+      - ALLOWLIST_PREFIXES=https://api.example.com/,https://jsonplaceholder.typicode.com/
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - nl-api-net
+
+  # =============================================================================
+  # OPA Policy Engine - Security and authorization
+  # ROLE: Enforces access control policies before tool execution
+  # WHY OPA?
+  # - Declarative policies (Rego language - like SQL for authorization)
+  # - Fast evaluation (<1ms per policy check)
+  # - Separation of concerns (security logic decoupled from business logic)
+  #
+  # EXAMPLE POLICY: Only "support_agent" role can call "list_tickets"
+  # PREVENTS: Prompt injection attacks, unauthorized tool access
+  # =============================================================================
+  mcp-policy:
+    image: openpolicyagent/opa:latest  # Official OPA image (10MB, very lightweight)
+    ports:
+      - "8181:8181"  # OPA API endpoint
+    command:
+      - "run"  # Run OPA server
+      - "--server"  # Enable REST API
+      - "--addr=0.0.0.0:8181"  # Bind to all interfaces
+      - "/policies"  # Load policies from this directory
+    volumes:
+      - ./mcp/policy:/policies:ro  # Read-only policy files (*.rego)
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8181/health?bundle=true" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - nl-api-net
+
+# =============================================================================
+# Networking
+# =============================================================================
+networks:
+  nl-api-net:
+    driver: bridge
+
+# =============================================================================
+# Persistent Storage
+# =============================================================================
+volumes:
+  ollama-data:     # Stores downloaded LLM models
+  embed-cache:     # Caches embedding models
+

@@ -1,0 +1,252 @@
+
+services:
+  # Main Orchestrator Service
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./orchestrator/registry:/app/registry:ro
+      - ./orchestrator/src:/app/src:ro
+    depends_on:
+      - ollama
+      - mcp-embed
+      - mcp-api
+      - mcp-policy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - nl-api-net
+
+  # Ollama - Local LLM Server
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - nl-api-net
+
+  # Alternative: vLLM (comment out ollama and uncomment this block)
+  # vllm:
+  #   image: vllm/vllm-openai:latest
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+  #   command: >
+  #     --model meta-llama/Meta-Llama-3.1-8B-Instruct
+  #     --host 0.0.0.0
+  #     --port 8000
+  #     --max-model-len 4096
+  #     --dtype auto
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   volumes:
+  #     - vllm-cache:/root/.cache/huggingface
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 120s
+  #   networks:
+  #     - nl-api-net
+
+  # MCP Embeddings & Vector Search Server
+  mcp-embed:
+    build:
+      context: ./mcp/embed_tools
+      dockerfile: Dockerfile
+    ports:
+      - "9001:9001"
+    environment:
+      - EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./orchestrator/registry:/app/registry:ro
+      - embed-cache:/root/.cache
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - nl-api-net
+
+  # MCP API Tools Server
+  mcp-api:
+    build:
+      context: ./mcp/api_tools
+      dockerfile: Dockerfile
+    ports:
+      - "9000:9000"
+    environment:
+      - API_TOKEN=${API_TOKEN:-demo-token}
+      - ALLOWLIST_PREFIXES=${ALLOWLIST_PREFIXES:-https://api.example.com/}
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - nl-api-net
+
+  # OPA Policy Engine
+  mcp-policy:
+    image: openpolicyagent/opa:latest
+    ports:
+      - "8181:8181"
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "/policies"
+    volumes:
+      - ./mcp/policy:/policies:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8181/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - nl-api-net
+
+  # Traefik Gateway (for allowlist enforcement)
+  traefik:
+    image: traefik:v2.10
+    ports:
+      - "80:80"
+      - "8090:8080"  # Dashboard
+    volumes:
+      - ./gateway/traefik.yml:/etc/traefik/traefik.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - nl-api-net
+
+  # OpenTelemetry Collector
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./ops/otelcol-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus metrics
+    networks:
+      - nl-api-net
+
+  # Jaeger - Distributed Tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"  # UI
+      - "14268:14268"  # Collector
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - nl-api-net
+
+  # Prometheus - Metrics Storage
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - nl-api-net
+
+  # Grafana - Dashboards
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+    volumes:
+      - ./ops/grafana-provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - nl-api-net
+
+  # Loki - Log Aggregation
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./ops/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    command: -config.file=/etc/loki/loki-config.yaml
+    networks:
+      - nl-api-net
+
+  # =============================================================================
+  # Promtail - Log Shipper
+  # ❌ NOT NEEDED FOR POC - Ships logs to Loki
+  # =============================================================================
+  promtail:
+    image: grafana/promtail:latest
+    volumes:
+      - ./ops/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/promtail-config.yml
+    networks:
+      - nl-api-net
+
+networks:
+  nl-api-net:
+    driver: bridge
+
+volumes:
+  vllm-cache:
+  ollama-data:
+  embed-cache:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+
+

@@ -1,0 +1,175 @@
+[
+  {
+    "name": "create_ticket",
+    "description": "Create a support ticket with title, description, priority, and optional assignee. Use this when users report issues, problems, or request help.",
+    "endpoint": "POST https://api.example.com/tickets",
+    "auth": "bearer",
+    "risk": "medium",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 100,
+          "description": "Short summary of the ticket"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 2000,
+          "description": "Detailed description of the issue or request"
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "urgent"],
+          "description": "Priority level of the ticket"
+        },
+        "assignee_id": {
+          "type": "string",
+          "description": "Optional user ID to assign the ticket to"
+        }
+      },
+      "required": ["title", "description", "priority"]
+    },
+    "examples": [
+      {
+        "user": "Open urgent ticket for payment failure",
+        "payload": {
+          "title": "Payment failure",
+          "description": "Gateway errors for user payment processing",
+          "priority": "urgent"
+        }
+      },
+      {
+        "user": "Create a high priority ticket about the API being down",
+        "payload": {
+          "title": "API Downtime",
+          "description": "Production API is returning 503 errors for all endpoints since 2pm",
+          "priority": "high"
+        }
+      },
+      {
+        "user": "I need help with login issues, not very urgent",
+        "payload": {
+          "title": "Login Issues",
+          "description": "User experiencing intermittent login failures on mobile app",
+          "priority": "medium"
+        }
+      }
+    ]
+  },
+  {
+    "name": "list_tickets",
+    "description": "Retrieve a list of tickets with optional filtering by status, priority, or assignee. Use this when users want to view, check, or review existing tickets.",
+    "endpoint": "GET https://api.example.com/tickets",
+    "auth": "bearer",
+    "risk": "low",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["open", "in_progress", "closed", "all"],
+          "description": "Filter by ticket status"
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "urgent", "all"],
+          "description": "Filter by priority level"
+        },
+        "assignee_id": {
+          "type": "string",
+          "description": "Filter by assignee user ID"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 20,
+          "description": "Maximum number of tickets to return"
+        }
+      },
+      "required": []
+    },
+    "examples": [
+      {
+        "user": "Show me all open tickets",
+        "payload": {
+          "status": "open",
+          "limit": 20
+        }
+      },
+      {
+        "user": "List urgent tickets",
+        "payload": {
+          "priority": "urgent",
+          "status": "all",
+          "limit": 50
+        }
+      },
+      {
+        "user": "What tickets are assigned to user123?",
+        "payload": {
+          "assignee_id": "user123",
+          "status": "all"
+        }
+      }
+    ]
+  },
+  {
+    "name": "update_ticket",
+    "description": "Update an existing ticket's status, priority, or assignee. Use this when users want to modify, change, or update ticket details.",
+    "endpoint": "PATCH https://api.example.com/tickets/{ticket_id}",
+    "auth": "bearer",
+    "risk": "medium",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "ticket_id": {
+          "type": "string",
+          "description": "The ID of the ticket to update"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["open", "in_progress", "closed"],
+          "description": "New status for the ticket"
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "urgent"],
+          "description": "New priority level"
+        },
+        "assignee_id": {
+          "type": "string",
+          "description": "New assignee user ID"
+        }
+      },
+      "required": ["ticket_id"]
+    },
+    "examples": [
+      {
+        "user": "Close ticket TKT-123",
+        "payload": {
+          "ticket_id": "TKT-123",
+          "status": "closed"
+        }
+      },
+      {
+        "user": "Assign ticket TKT-456 to user789",
+        "payload": {
+          "ticket_id": "TKT-456",
+          "assignee_id": "user789"
+        }
+      },
+      {
+        "user": "Change priority of ticket TKT-789 to urgent",
+        "payload": {
+          "ticket_id": "TKT-789",
+          "priority": "urgent"
+        }
+      }
+    ]
+  }
+]
+

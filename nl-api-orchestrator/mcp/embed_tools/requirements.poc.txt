@@ -1,0 +1,25 @@
+# =============================================================================
+# faiss-gpu==1.7.4
+# GPU version (much larger, use only if GPU required)
+# =============================================================================
+# REMOVED FOR POC:
+# =============================================================================
+
+numpy==1.26.3
+faiss-cpu==1.7.4
+# Note: faiss-cpu is lighter than faiss-gpu
+# Vector operations (use CPU version for faster build)
+
+sentence-transformers==2.3.1
+# Embeddings (essential for RAG)
+
+pydantic==2.5.3
+# Data Validation
+
+uvicorn[standard]==0.27.0
+fastapi==0.109.0
+# Web Framework
+
+# =============================================================================
+# MINIMAL POC DEPENDENCIES - MCP Embed Tools
+
