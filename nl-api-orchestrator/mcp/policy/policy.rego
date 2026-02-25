@@ -1,61 +1,70 @@
 package policy
 
-# Default deny
+# =============================================================================
+# NMS Credential Management – Authorization Policy
+#
+# Risk levels are sourced from credential_api_nlp_metadata.security_levels:
+#
+#   low      – read-only ops (get, list, check)   → always allow
+#   medium   – trust/untrust, certificate reads   → allow with valid user
+#   high     – copy, set, delete credentials      → require confirmation
+#   critical – bulk set, view decrypted password  → require confirmation
+#              (+ additional verification in future)
+# =============================================================================
+
+# Default deny – safe by default
 default allow = false
 
-# Allow low-risk operations with valid payload
+# ── Low-risk: always allow (view, list, check operations) ─────────────────────
 allow if {
     input.risk == "low"
-    input.payload
 }
 
-# Allow medium-risk operations with sufficient description
+# ── Medium-risk: allow if a user identity is present ──────────────────────────
 allow if {
     input.risk == "medium"
-    input.payload.description
-    count(input.payload.description) >= 10
+    input.user != ""
+    input.user != null
 }
 
-# High-risk operations require explicit confirmation
+# ── High-risk: require explicit confirmation (copy, set, delete credentials) ──
 allow if {
     input.risk == "high"
     input.confirmed == true
-    input.payload.description
-    count(input.payload.description) >= 20
 }
 
-# Deny with reason
-reason = msg if {
+# ── Critical-risk: require explicit confirmation (bulk set, decrypt password) ──
+allow if {
+    input.risk == "critical"
+    input.confirmed == true
+}
+
+# =============================================================================
+# Human-readable deny reasons
+# =============================================================================
+
+deny_reason := msg if {
     not allow
     input.risk == "high"
     not input.confirmed
-    msg := "High-risk operation requires explicit confirmation"
+    msg := "High-risk operation requires explicit confirmation (send confirmed=true)"
 }
 
-reason = msg if {
+deny_reason := msg if {
+    not allow
+    input.risk == "critical"
+    not input.confirmed
+    msg := "Critical-risk operation requires explicit confirmation (send confirmed=true)"
+}
+
+deny_reason := msg if {
     not allow
     input.risk == "medium"
-    not input.payload.description
-    msg := "Medium-risk operations require a description"
+    not input.user
+    msg := "Medium-risk operation requires an authenticated user"
 }
 
-reason = msg if {
-    not allow
-    input.risk == "medium"
-    count(input.payload.description) < 10
-    msg := "Description must be at least 10 characters for medium-risk operations"
-}
-
-reason = msg if {
-    not allow
-    input.risk == "high"
-    input.confirmed == true
-    count(input.payload.description) < 20
-    msg := "Description must be at least 20 characters for high-risk operations"
-}
-
-reason = "Policy check failed" if {
+deny_reason := "Policy check failed: unknown risk level or missing input" if {
     not allow
     not input.risk
 }
-

@@ -34,8 +34,11 @@ services:
       - EMBED_SERVER_URL=http://mcp-embed:9001
       - API_TOOLS_URL=http://mcp-api:9000
       - OPA_URL=http://mcp-policy:8181/v1/data/policy
+      - REGISTRY_PATH=/app/registry/credential_api_schema_rag.json
+      - REGISTRY_DIR=/app/registry
+      - NLP_METADATA_PATH=/app/registry/credential_api_nlp_metadata.json
+      - TRAINING_EXAMPLES_PATH=/app/registry/credential_api_rag_training_examples.json
       - LOG_LEVEL=INFO
-      # Disable monitoring features
       - ENABLE_TRACING=false
       - ENABLE_METRICS=false
     volumes:
@@ -101,11 +104,16 @@ services:
       - EMBED_MODEL=BAAI/bge-small-en-v1.5
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
+      # Registry directory containing ALL three JSON data sources:
+      #   credential_api_schema_rag.json          (API schemas)
+      #   credential_api_nlp_metadata.json        (intent patterns, synonyms, training samples)
+      #   credential_api_rag_training_examples.json (real user query examples)
+      - REGISTRY_DIR=/app/registry
       # Disable unnecessary logging for faster startup
       - TRANSFORMERS_VERBOSITY=error
       - TOKENIZERS_PARALLELISM=false
     volumes:
-      - ./orchestrator/registry:/app/registry:ro
+      - ./orchestrator/registry:/app/registry:ro  # mounts all three JSON files
       - embed-cache:/root/.cache  # Persists model cache across restarts
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
@@ -117,18 +125,21 @@ services:
       - nl-api-net
 
   # =============================================================================
-  # MCP API Tools Server - Executes API calls
-  # Implements MCP protocol for tool execution
+  # MCP API Tools Server - Executes NMS Credential Management API calls
+  # Implements all 13 tools from credential_api_schema_rag.json
+  # POC mode: returns realistic mock responses
+  # Production: set ALLOWLIST_PREFIXES to https://api.sinecnms.com/
   # =============================================================================
   mcp-api:
     build:
       context: ./mcp/api_tools
-      dockerfile: Dockerfile.poc  # Minimal dependencies
+      dockerfile: Dockerfile.poc
     ports:
-      - "9090:9090"
+      - "9002:9000"          # host:9002 → container:9000 (9000 already in use on host)
     environment:
       - API_TOKEN=demo-token
-      - ALLOWLIST_PREFIXES=https://api.example.com/,https://jsonplaceholder.typicode.com/
+      # Add real NMS base URL here for production
+      - ALLOWLIST_PREFIXES=https://api.sinecnms.com/,https://api.example.com/
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
     healthcheck:
@@ -142,14 +153,11 @@ services:
 
   # =============================================================================
   # OPA Policy Engine - Security and authorization
-  # ROLE: Enforces access control policies before tool execution
-  # WHY OPA?
-  # - Declarative policies (Rego language - like SQL for authorization)
-  # - Fast evaluation (<1ms per policy check)
-  # - Separation of concerns (security logic decoupled from business logic)
-  #
-  # EXAMPLE POLICY: Only "support_agent" role can call "list_tickets"
-  # PREVENTS: Prompt injection attacks, unauthorized tool access
+  # Enforces NMS security_levels from credential_api_nlp_metadata.json:
+  #   low      → always allow  (get, list, check)
+  #   medium   → require user  (trust/untrust, certificate)
+  #   high     → require confirmed=true  (copy, set, delete)
+  #   critical → require confirmed=true  (bulk set, view decrypted)
   # =============================================================================
   mcp-policy:
     image: openpolicyagent/opa:latest  # Official OPA image (10MB, very lightweight)

@@ -31,8 +31,11 @@ class Settings(BaseSettings):
     otel_service_name: str = "nl-api-orchestrator"
     log_level: str = "INFO"
 
-    # Registry
-    registry_path: str = "/app/registry/capabilities.json"
+    # Registry – all three NMS data sources
+    registry_path: str = "/app/registry/credential_api_schema_rag.json"
+    registry_dir: str = "/app/registry"
+    nlp_metadata_path: str = "/app/registry/credential_api_nlp_metadata.json"
+    training_examples_path: str = "/app/registry/credential_api_rag_training_examples.json"
 
     class Config:
         env_file = ".env"

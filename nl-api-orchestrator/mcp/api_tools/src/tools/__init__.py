@@ -1,15 +1,38 @@
 """
-Tools registry.
-Import and register all available tools here.
+NMS Credential Management – Tool Registry.
+All 13 tools from credential_api_schema_rag.json are registered here.
 """
-from .create_ticket import create_ticket
-from .list_tickets import list_tickets
+from .nms_credentials import (
+    copy_device_credentials,
+    get_device_detail_credentials,
+    get_all_device_credentials,
+    set_device_credentials,
+    set_bulk_device_credentials,
+    delete_device_credentials,
+    trust_device_credentials,
+    untrust_device_credentials,
+    get_https_certificate,
+    get_https_port,
+    get_default_device_credentials,
+    view_decrypted_password,
+    check_role_rights_credentials,
+)
 
-# Registry of all available tools
+# Registry: tool_name → async handler function
 TOOLS = {
-    "create_ticket": create_ticket,
-    "list_tickets": list_tickets,
+    "copy_device_credentials":       copy_device_credentials,
+    "get_device_detail_credentials":  get_device_detail_credentials,
+    "get_all_device_credentials":     get_all_device_credentials,
+    "set_device_credentials":         set_device_credentials,
+    "set_bulk_device_credentials":    set_bulk_device_credentials,
+    "delete_device_credentials":      delete_device_credentials,
+    "trust_device_credentials":       trust_device_credentials,
+    "untrust_device_credentials":     untrust_device_credentials,
+    "get_https_certificate":          get_https_certificate,
+    "get_https_port":                 get_https_port,
+    "get_default_device_credentials": get_default_device_credentials,
+    "view_decrypted_password":        view_decrypted_password,
+    "check_role_rights_credentials":  check_role_rights_credentials,
 }
 
-__all__ = ["TOOLS", "create_ticket", "list_tickets"]
-
+__all__ = ["TOOLS"]

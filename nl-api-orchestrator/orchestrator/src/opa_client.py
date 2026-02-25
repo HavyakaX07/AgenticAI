@@ -79,8 +79,12 @@ class OPAClient:
                     logger.info(f"Policy decision (boolean): allow={allow}")
                 # Handle object result (when querying /v1/data/policy)
                 elif isinstance(policy_result, dict):
-                    allow = policy_result.get("allow", False)
-                    reason = policy_result.get("reason", "")
+                    allow  = policy_result.get("allow", False)
+                    # NMS policy returns deny_reason (singular string) not reason
+                    reason = (
+                        policy_result.get("deny_reason")
+                        or policy_result.get("reason", "")
+                    )
                     logger.info(f"Policy decision (object): allow={allow}, reason={reason}")
                 else:
                     # Unexpected format

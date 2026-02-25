@@ -66,7 +66,7 @@ class OrchestrationRequest(BaseModel):
 
 class OrchestrationResponse(BaseModel):
     """Response model for orchestration endpoint."""
-    decision: str = Field(..., description="Decision: USE_TOOL, ASK_USER, or NONE")
+    decision: str = Field(..., description="Decision: USE_TOOL, ASK_USER, GENERAL_RESPONSE, or NONE")
     tool_used: Optional[str] = Field(None, description="Name of the tool that was used")
     tool_name: Optional[str] = Field(None, description="Name of the selected tool")
     request_payload: Optional[Dict[str, Any]] = Field(None, description="Payload sent to the tool")
@@ -217,15 +217,8 @@ async def orchestrate(request: OrchestrationRequest):
                     logger.info(f"[{session_id}] Found {len(candidates)} candidate capabilities")
                     span.set_attribute("candidates_count", len(candidates))
 
-                if not candidates:
-                    REQUEST_COUNT.labels(decision="NONE", tool="none").inc()
-                    return OrchestrationResponse(
-                        decision="NONE",
-                        message="I don't have access to tools that can help with this request.",
-                        session_id=session_id
-                    )
-
-                # Step 2: LLM - Select tool and fill payload
+                # Step 2: LLM - Select tool and fill payload (or handle general conversation)
+                # Even if no candidates found, LLM can detect general conversational queries
                 with tracer.start_as_current_span("llm_reasoning"):
                     logger.info(f"[{session_id}] Invoking LLM for tool selection...")
                     llm_response = await router.route(request.query, candidates)
@@ -244,6 +237,17 @@ async def orchestrate(request: OrchestrationRequest):
                     usage = llm_response["usage"]
                     LLM_TOKENS.labels(type="prompt").inc(usage.get("prompt_tokens", 0))
                     LLM_TOKENS.labels(type="completion").inc(usage.get("completion_tokens", 0))
+
+                # Handle GENERAL_RESPONSE decision (greetings, thanks, general conversation)
+                if decision == "GENERAL_RESPONSE":
+                    REQUEST_COUNT.labels(decision="GENERAL_RESPONSE", tool="none").inc()
+                    response_text = llm_response.get("response", "Hello! How can I help you with network device management today?")
+                    logger.info(f"[{session_id}] General conversational response")
+                    return OrchestrationResponse(
+                        decision="GENERAL_RESPONSE",
+                        message=response_text,
+                        session_id=session_id
+                    )
 
                 # Handle ASK_USER decision
                 if decision == "ASK_USER" or missing_fields:

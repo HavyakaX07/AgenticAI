@@ -46,7 +46,7 @@ class OrchestrationRequest(BaseModel):
 
 class OrchestrationResponse(BaseModel):
     """Response model for orchestration endpoint."""
-    decision: str = Field(..., description="Decision: USE_TOOL, ASK_USER, or NONE")
+    decision: str = Field(..., description="Decision: USE_TOOL, ASK_USER, GENERAL_RESPONSE, or NONE")
     tool_used: Optional[str] = Field(None, description="Name of the tool that was used")
     tool_name: Optional[str] = Field(None, description="Name of the selected tool")
     request_payload: Optional[Dict[str, Any]] = Field(None, description="Payload sent to the tool")
@@ -70,13 +70,15 @@ async def startup_event():
     global retriever, router, mcp_client, opa_client
 
     logger.info("=" * 80)
-    logger.info("Starting NL → API Orchestrator (POC Mode)...")
+    logger.info("Starting NMS Credential Management Orchestrator (POC Mode)...")
     logger.info("=" * 80)
-    logger.info(f"LLM Provider: {settings.llm_provider}")
-    logger.info(f"Model: {settings.model_name}")
-    logger.info(f"Embed Server: {settings.embed_server_url}")
-    logger.info(f"API Tools: {settings.api_tools_url}")
-    logger.info(f"OPA: {settings.opa_url}")
+    logger.info(f"LLM Provider : {settings.llm_provider}")
+    logger.info(f"Model        : {settings.model_name}")
+    logger.info(f"Embed Server : {settings.embed_server_url}")
+    logger.info(f"API Tools    : {settings.api_tools_url}")
+    logger.info(f"OPA          : {settings.opa_url}")
+    logger.info(f"Registry     : {settings.registry_path}")
+    logger.info(f"NLP Metadata : {settings.nlp_metadata_path}")
     logger.info("=" * 80)
 
     try:
@@ -174,6 +176,72 @@ async def health_check():
     return health_status
 
 
+def _build_nms_message(tool_name: str, payload: dict, api_result: dict, notes: str) -> str:
+    """
+    Build a human-friendly response message using NMS response_templates
+    from credential_api_nlp_metadata.json.
+    """
+    status = api_result.get("status", "success")
+    error  = api_result.get("error", api_result.get("message", ""))
+
+    if status in ("error", "failed"):
+        return f"Operation failed: {error}" if error else f"{tool_name} failed."
+
+    if tool_name == "copy_device_credentials":
+        src   = payload.get("source", "source device")
+        dests = payload.get("destinations", [])
+        count = api_result.get("credentials_copied", len(dests))
+        dest_str = ", ".join(dests) if isinstance(dests, list) else str(dests)
+        return f"Successfully copied credentials from {src} to {count} device(s): {dest_str}"
+
+    if tool_name == "get_device_detail_credentials":
+        dev = payload.get("deviceId", "device")
+        snmp_status = "configured" if api_result.get("snmpRead") else "not configured"
+        cli_status  = "configured" if api_result.get("cli")     else "not configured"
+        return f"Retrieved credentials for device {dev}. SNMP: {snmp_status}, CLI: {cli_status}"
+
+    if tool_name in ("set_device_credentials", "set_bulk_device_credentials"):
+        dev_ids = payload.get("deviceId", payload.get("deviceIds", []))
+        count   = len(dev_ids) if isinstance(dev_ids, list) else 1
+        return f"Successfully updated credentials for {count} device(s)"
+
+    if tool_name == "delete_device_credentials":
+        dev_ids = payload.get("deviceIds", [])
+        count   = len(dev_ids) if isinstance(dev_ids, list) else 1
+        return f"Successfully deleted credentials for {count} device(s)"
+
+    if tool_name == "trust_device_credentials":
+        dev_ids = payload.get("deviceIds", [])
+        return f"Trusted {len(dev_ids) if isinstance(dev_ids, list) else 1} device(s)"
+
+    if tool_name == "untrust_device_credentials":
+        dev_ids = payload.get("deviceIds", [])
+        return f"Revoked trust for {len(dev_ids) if isinstance(dev_ids, list) else 1} device(s)"
+
+    if tool_name == "get_all_device_credentials":
+        count = api_result.get("total", api_result.get("count", "all"))
+        return f"Retrieved {count} device credential records"
+
+    if tool_name == "get_https_certificate":
+        dev = payload.get("deviceId", "device")
+        return f"Retrieved HTTPS certificate for device {dev}"
+
+    if tool_name == "get_https_port":
+        dev  = payload.get("deviceId", "device")
+        port = api_result.get("httpsPort", "")
+        return f"HTTPS port for {dev} is {port}" if port else f"Retrieved HTTPS port for {dev}"
+
+    if tool_name == "check_role_rights_credentials":
+        rights = api_result.get("rights", api_result.get("role", ""))
+        return f"Your access rights: {rights}" if rights else "Retrieved your permission details"
+
+    if tool_name == "view_decrypted_password":
+        return "Decrypted password retrieved successfully"
+
+    # Fallback
+    return notes or f"Successfully executed {tool_name}."
+
+
 @app.post("/orchestrate", response_model=OrchestrationResponse)
 async def orchestrate(request: OrchestrationRequest):
     """
@@ -198,20 +266,13 @@ async def orchestrate(request: OrchestrationRequest):
     try:
         # Step 1: RAG - Retrieve candidate capabilities
         logger.info(f"[{session_id}] Step 1: Retrieving capabilities via RAG...")
-        candidates = await retriever.retrieve(request.query, top_k=3)
+        candidates = await retriever.retrieve(request.query, top_k=1)
         logger.info(f"[{session_id}] → Found {len(candidates)} candidate capabilities")
         for i, candidate in enumerate(candidates, 1):
-            logger.info(f"[{session_id}]   {i}. {candidate['name']}: {candidate['description'][:60]}...")
+            logger.info(f"[{session_id}]   {i}. {candidate['name']}: {candidate['description'][:-1]}...")
 
-        if not candidates:
-            logger.info(f"[{session_id}] → No matching capabilities found")
-            return OrchestrationResponse(
-                decision="NONE",
-                message="I don't have access to tools that can help with this request.",
-                session_id=session_id
-            )
-
-        # Step 2: LLM - Select tool and fill payload
+        # Step 2: LLM - Select tool and fill payload (or handle general conversation)
+        # Even if no candidates found, LLM can detect general conversational queries
         logger.info(f"[{session_id}] Step 2: LLM reasoning for tool selection...")
         llm_response = await router.route(request.query, candidates)
         decision = llm_response.get("decision", "NONE")
@@ -223,6 +284,16 @@ async def orchestrate(request: OrchestrationRequest):
         logger.info(f"[{session_id}] → LLM Decision: {decision}")
         logger.info(f"[{session_id}] → Tool Name: {tool_name}")
         logger.info(f"[{session_id}] → Payload: {payload}")
+
+        # Handle GENERAL_RESPONSE decision (greetings, thanks, general conversation)
+        if decision == "GENERAL_RESPONSE":
+            response_text = llm_response.get("response", "Hello! How can I help you with network device management today?")
+            logger.info(f"[{session_id}] → General conversational response")
+            return OrchestrationResponse(
+                decision="GENERAL_RESPONSE",
+                message=response_text,
+                session_id=session_id
+            )
 
         # Handle ASK_USER decision
         if decision == "ASK_USER" or missing_fields:
@@ -264,7 +335,8 @@ async def orchestrate(request: OrchestrationRequest):
         logger.info(f"[{session_id}] Step 3: Validating payload...")
         is_valid, validation_error = validate_payload(
             payload,
-            capability["input_schema"]
+            capability["input_schema"],
+            tool_name=tool_name          # enables NMS conditional SNMP checks
         )
 
         if not is_valid:
@@ -284,12 +356,13 @@ async def orchestrate(request: OrchestrationRequest):
 
         # Step 5: Policy check
         logger.info(f"[{session_id}] Step 5: Checking OPA policy...")
+        risk_level = capability.get("risk", "medium")
         policy_input = {
             "payload": payload,
             "tool": tool_name,
-            "risk": capability.get("risk", "medium"),
+            "risk": risk_level,
             "confirmed": request.confirmed,
-            "user": "default_user"  # Can be extracted from auth context
+            "user": "default_user"
         }
 
         policy_result = await opa_client.check_policy(policy_input)
@@ -299,13 +372,13 @@ async def orchestrate(request: OrchestrationRequest):
             reason = policy_result.get("reason", "Policy check failed")
             logger.warning(f"[{session_id}] → Policy denied: {reason}")
 
-            # For high-risk operations, ask for confirmation
-            if capability.get("risk") == "high" and not request.confirmed:
+            # high and critical operations both require confirmation
+            if risk_level in ("high", "critical") and not request.confirmed:
                 return OrchestrationResponse(
                     decision="ASK_USER",
                     tool_name=tool_name,
                     request_payload=payload,
-                    message=f"This is a high-risk operation. {reason}. Please confirm.",
+                    message=f"This is a {risk_level}-risk operation ({tool_name}). {reason}. Please confirm by re-sending with confirmed=true.",
                     confirm_fields=payload,
                     session_id=session_id
                 )
@@ -323,14 +396,8 @@ async def orchestrate(request: OrchestrationRequest):
         logger.info(f"[{session_id}] → Tool execution result: {api_result.get('status')}")
         logger.info(f"[{session_id}] → API result: {api_result}")
 
-        # Step 7: Generate user-friendly message
-        message = f"Successfully executed {tool_name}."
-        if "ticket_id" in api_result:
-            message = f"Created ticket {api_result['ticket_id']} successfully."
-        elif "count" in api_result:
-            message = f"Found {api_result['count']} tickets."
-        elif notes:
-            message = notes
+        # Step 7: Generate NMS-aware user-friendly message
+        message = _build_nms_message(tool_name, payload, api_result, notes)
 
         logger.info(f"[{session_id}] ========================================")
         logger.info(f"[{session_id}] ✓ Orchestration completed successfully")
