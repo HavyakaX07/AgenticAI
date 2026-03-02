@@ -37,6 +37,12 @@ uvicorn[standard]==0.27.0
 fastapi==0.109.0
 # Web Framework
 
+asyncpg==0.29.0
+# PostgreSQL async driver (optional, for production DB)
+
+aiosqlite==0.19.0
+# SQLite async driver (optional, for lightweight DB)
+
 # =============================================================================
 # MINIMAL POC DEPENDENCIES - Essential packages only
 

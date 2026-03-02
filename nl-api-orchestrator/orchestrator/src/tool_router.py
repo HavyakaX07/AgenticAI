@@ -32,13 +32,25 @@ class ToolRouter:
         logger.info(f"Initialized ToolRouter with model: {model_name}")
 
     async def check_health(self):
-        """Check if LLM server is healthy."""
+        """Check if the host-installed Ollama is reachable and the model is available."""
         try:
-            # Try to list models as a health check
-            await self.client.models.list()
+            models = await self.client.models.list()
+            model_ids = [m.id for m in models.data]
+            logger.info(f"Ollama reachable. Available models: {model_ids}")
+
+            # Warn if the configured model isn't pulled yet
+            if self.model_name not in model_ids:
+                logger.warning(
+                    f"Model '{self.model_name}' is NOT present in Ollama. "
+                    f"Run:  ollama pull {self.model_name}  on the host machine."
+                )
         except Exception as e:
-            logger.error(f"LLM health check failed: {e}")
-            raise
+            raise RuntimeError(
+                f"Cannot reach Ollama at '{self.client.base_url}'. "
+                f"Make sure Ollama is installed and running on the host: "
+                f"https://ollama.com  –  then run `ollama serve`. "
+                f"Original error: {e}"
+            ) from e
 
     async def route(self, query: str, capabilities: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -76,7 +88,7 @@ class ToolRouter:
                 )
 
             content = response.choices[0].message.content
-            logger.debug(f"LLM response: {content}")
+            logger.info(f"LLM response: {content}")
 
             # Parse JSON response
             try:

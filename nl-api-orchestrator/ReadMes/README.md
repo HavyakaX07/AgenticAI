@@ -1,660 +1,212 @@
-# NL → API Orchestrator
+# 📚 NMS API Orchestrator - Documentation
 
-A **local, dockerized natural language to API orchestrator** that intelligently routes user queries to appropriate APIs using RAG, LLM reasoning, and policy enforcement.
-
-## 🏗️ Architecture
-
-```mermaid
-graph TB
-    User[User] -->|NL Query| Orchestrator[Orchestrator API]
-    Orchestrator -->|1. Retrieve| Embed[MCP Embed Server]
-    Orchestrator -->|2. Reason| LLM[vLLM / Ollama]
-    Orchestrator -->|3. Validate| Validator[JSON Schema Validator]
-    Orchestrator -->|4. Policy Check| OPA[OPA Policy Engine]
-    Orchestrator -->|5. Execute| APITools[MCP API Tools]
-    APITools -->|Allowlisted| Gateway[Traefik Gateway]
-    Gateway -->|External| APIs[Upstream APIs]
-    
-    Embed -->|Vector Search| FAISS[FAISS Index]
-    Registry[Capability Registry] -.->|Loaded by| Embed
-    Registry -.->|Used by| Orchestrator
-    
-    Orchestrator -->|Traces/Metrics| OTel[OpenTelemetry Collector]
-    OTel -->|Metrics| Prometheus
-    OTel -->|Traces| Jaeger
-    Orchestrator -->|Logs| Loki
-    
-    style Orchestrator fill:#4A90E2
-    style LLM fill:#F39C12
-    style OPA fill:#E74C3C
-    style APITools fill:#27AE60
-```
-
-## 🔄 Sequence Flow
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant O as Orchestrator
-    participant E as Embed Server
-    participant L as LLM
-    participant V as Validator
-    participant P as OPA Policy
-    participant A as API Tools
-    participant G as Gateway
-
-    U->>O: POST /orchestrate {query}
-    O->>E: POST /embed {text: query}
-    E-->>O: {vector: [...]}
-    O->>E: POST /search {vector}
-    E-->>O: {ids: [cap1, cap2], scores}
-    
-    O->>L: Chat completion (tools + query)
-    L-->>O: {decision, tool_name, payload}
-    
-    alt Missing Required Fields
-        O-->>U: {decision: ASK_USER, missing_fields}
-    else Complete Payload
-        O->>V: Validate payload against schema
-        V-->>O: Valid ✓
-        
-        O->>P: POST /v1/data/policy/allow
-        P-->>O: {allow: true/false, reason}
-        
-        alt Policy Denied or High Risk
-            O-->>U: {decision: ASK_USER, reason}
-        else Policy Allowed
-            O->>A: POST /tools/invoke {tool, args}
-            A->>G: HTTP request (allowlisted)
-            G-->>A: Response
-            A-->>O: {status, result}
-            O-->>U: {decision: USE_TOOL, result, message}
-        end
-    end
-```
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- Docker 20.10+
-- Docker Compose 2.0+
-- 16GB+ RAM recommended (for local LLM)
-- 20GB+ disk space
-
-### 1. Clone and Configure
-
-```bash
-cd nl-api-orchestrator
-cp .env.example .env
-# Edit .env if needed (defaults work out-of-box)
-```
-
-### 2. Start All Services
-
-```bash
-docker compose up -d --build
-```
-
-This will start:
-- **orchestrator** (FastAPI) on `:8080`
-- **vllm** (LLM server) on `:8000`
-- **mcp-embed** (embeddings) on `:9001`
-- **mcp-api** (API tools) on `:9000`
-- **mcp-policy** (OPA) on `:8181`
-- **traefik** (gateway) on `:80`
-- Optional: **jaeger**, **prometheus**, **grafana** for observability
-
-### 3. Wait for Services to be Ready
-
-```bash
-# Check orchestrator health
-curl http://localhost:8080/health
-
-# Wait for vLLM to load model (can take 2-5 minutes)
-docker compose logs -f vllm
-```
-
-### 4. Test an Orchestration
-
-```bash
-curl -X POST http://localhost:8080/orchestrate \
-  -H "Content-Type: application/json" \
-  -d '{"query":"Open urgent ticket for payment failure"}' | jq
-```
-
-**Expected Response:**
-
-```json
-{
-  "decision": "USE_TOOL",
-  "tool_used": "create_ticket",
-  "request_payload": {
-    "title": "Payment failure",
-    "description": "Gateway errors for user payment processing",
-    "priority": "urgent"
-  },
-  "api_result": {
-    "status": "ok",
-    "ticket_id": "TKT-12345"
-  },
-  "message": "Successfully created urgent ticket for payment failure.",
-  "session_id": "..."
-}
-```
-
-## 📝 More Examples
-
-### Query with Missing Information
-
-```bash
-curl -X POST http://localhost:8080/orchestrate \
-  -H "Content-Type: application/json" \
-  -d '{"query":"Create a ticket"}' | jq
-```
-
-**Response:**
-
-```json
-{
-  "decision": "ASK_USER",
-  "tool_name": "create_ticket",
-  "missing_fields": ["title", "description", "priority"],
-  "message": "I need more information to create a ticket. Please provide: title, description, priority",
-  "session_id": "..."
-}
-```
-
-### List Available Tickets
-
-```bash
-curl -X POST http://localhost:8080/orchestrate \
-  -H "Content-Type: application/json" \
-  -d '{"query":"Show me all open tickets"}' | jq
-```
-
-### No Matching Tool
-
-```bash
-curl -X POST http://localhost:8080/orchestrate \
-  -H "Content-Type: application/json" \
-  -d '{"query":"What is the weather today?"}' | jq
-```
-
-**Response:**
-
-```json
-{
-  "decision": "NONE",
-  "message": "I don't have access to tools that can help with this request.",
-  "session_id": "..."
-}
-```
-
-## 🔧 Configuration
-
-### Switching LLM Provider: vLLM ↔ Ollama
-
-**vLLM (default)** - Faster, OpenAI-compatible:
-
-```env
-LLM_PROVIDER=vllm
-OPENAI_BASE_URL=http://vllm:8000/v1
-MODEL_NAME=meta-llama/Meta-Llama-3.1-8B-Instruct
-```
-
-**Ollama** - Easier model management:
-
-1. Edit `docker-compose.yml`: comment out `vllm` service, uncomment `ollama`
-2. Update `.env`:
-
-```env
-LLM_PROVIDER=ollama
-OPENAI_BASE_URL=http://ollama:11434/v1
-MODEL_NAME=llama3.1:8b
-```
-
-3. Restart:
-
-```bash
-docker compose up -d --build
-```
-
-### Environment Variables
-
-See `.env.example` for all options:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LLM_PROVIDER` | `vllm` or `ollama` | `vllm` |
-| `MODEL_NAME` | LLM model identifier | `meta-llama/Meta-Llama-3.1-8B-Instruct` |
-| `EMBED_MODEL` | Sentence transformer model | `BAAI/bge-small-en-v1.5` |
-| `ALLOWLIST_PREFIXES` | Comma-separated URL prefixes | `https://api.example.com/` |
-| `OPA_URL` | Policy engine endpoint | `http://mcp-policy:8181/v1/data/policy/allow` |
-| `API_TOKEN` | Demo API token | `demo-token` |
-
-## 🛠️ Adding New API Tools
-
-### 1. Add Capability Card
-
-Edit `orchestrator/registry/capabilities.json`:
-
-```json
-{
-  "name": "send_email",
-  "description": "Send an email to a recipient with subject and body",
-  "endpoint": "POST https://api.example.com/emails",
-  "auth": "bearer",
-  "risk": "low",
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "to": {"type": "string", "format": "email"},
-      "subject": {"type": "string", "minLength": 1},
-      "body": {"type": "string", "minLength": 10}
-    },
-    "required": ["to", "subject", "body"]
-  },
-  "examples": [
-    {
-      "user": "Email John about the meeting",
-      "payload": {
-        "to": "john@example.com",
-        "subject": "Meeting Reminder",
-        "body": "Don't forget our meeting tomorrow at 10am"
-      }
-    }
-  ]
-}
-```
-
-### 2. Implement Tool Handler
-
-Create `mcp/api_tools/src/tools/send_email.py`:
-
-```python
-import httpx
-from typing import Dict, Any
-
-async def send_email(args: Dict[str, Any], allowlist: list, token: str) -> Dict[str, Any]:
-    """Send email via upstream API."""
-    endpoint = "https://api.example.com/emails"
-    
-    # Allowlist check happens in server.py
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            endpoint,
-            json=args,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30.0
-        )
-        response.raise_for_status()
-        return {"status": "ok", "email_id": response.json().get("id")}
-```
-
-### 3. Register Tool
-
-Add to `mcp/api_tools/src/tools/__init__.py`:
-
-```python
-from .send_email import send_email
-
-TOOLS = {
-    "create_ticket": create_ticket,
-    "list_tickets": list_tickets,
-    "send_email": send_email,  # Add this
-}
-```
-
-### 4. Rebuild and Test
-
-```bash
-docker compose up -d --build mcp-api orchestrator
-curl -X POST http://localhost:8080/orchestrate \
-  -H "Content-Type: application/json" \
-  -d '{"query":"Email john@example.com about the deployment"}' | jq
-```
-
-## 🔒 Security & Guardrails
-
-### 1. URL Allowlisting
-
-All outbound API calls are checked against `ALLOWLIST_PREFIXES`:
-
-```python
-# In mcp/api_tools/src/server.py
-def is_allowed(url: str, allowlist: list) -> bool:
-    return any(url.startswith(prefix) for prefix in allowlist)
-```
-
-Add more prefixes in `.env`:
-
-```env
-ALLOWLIST_PREFIXES=https://api.example.com/,https://api.trusted.com/,https://internal.corp/
-```
-
-### 2. JSON Schema Validation
-
-Every payload is validated against the capability's `input_schema`:
-
-```python
-# In orchestrator/src/validators.py
-from jsonschema import validate, ValidationError
-
-def validate_payload(payload: dict, schema: dict) -> tuple[bool, str]:
-    try:
-        validate(instance=payload, schema=schema)
-        return True, ""
-    except ValidationError as e:
-        return False, e.message
-```
-
-### 3. Policy Enforcement (OPA)
-
-Policies defined in `mcp/policy/policy.rego`:
-
-```rego
-package policy
-
-default allow = false
-
-# Allow low/medium risk operations with valid payload
-allow {
-    input.risk != "high"
-    input.payload.description
-    count(input.payload.description) >= 10
-}
-
-# High-risk requires explicit confirmation
-allow {
-    input.risk == "high"
-    input.confirmed == true
-}
-```
-
-### 4. Normalization
-
-Common synonyms are normalized before validation:
-
-```python
-# In orchestrator/src/normalizers.py
-PRIORITY_MAP = {
-    "asap": "urgent",
-    "critical": "urgent",
-    "low priority": "low",
-    "normal": "medium",
-}
-```
-
-### 5. Risk-Based Confirmation
-
-High-risk operations return `ASK_USER` with details:
-
-```json
-{
-  "decision": "ASK_USER",
-  "tool_name": "delete_database",
-  "reason": "High-risk operation requires explicit confirmation",
-  "confirm_fields": {
-    "database": "production_db",
-    "action": "delete"
-  }
-}
-```
-
-## 📊 Observability
-
-### Logs
-
-Structured JSON logs with correlation IDs:
-
-```bash
-docker compose logs -f orchestrator
-```
-
-### Traces (Jaeger)
-
-View distributed traces at [http://localhost:16686](http://localhost:16686)
-
-### Metrics (Prometheus)
-
-Scrape metrics at [http://localhost:9090](http://localhost:9090)
-
-- `orchestrator_requests_total{decision, tool}`
-- `orchestrator_request_duration_seconds`
-- `orchestrator_llm_tokens_total`
-
-### Dashboards (Grafana)
-
-Pre-built dashboard at [http://localhost:3000](http://localhost:3000) (admin/admin)
-
-## 🧪 Testing
-
-### Run Unit Tests
-
-```bash
-docker compose run --rm orchestrator pytest tests/ -v
-```
-
-### Test Coverage
-
-```bash
-docker compose run --rm orchestrator pytest tests/ --cov=src --cov-report=html
-```
-
-### Manual Testing
-
-See `orchestrator/tests/` for examples:
-
-- `test_orchestrate_happy.py` - Happy path E2E
-- `test_validation.py` - Schema validation edge cases
-- `conftest.py` - Pytest fixtures with mocks
-
-## 🐛 Troubleshooting
-
-### Services Not Starting
-
-```bash
-# Check service status
-docker compose ps
-
-# View logs for specific service
-docker compose logs ollama
-docker compose logs orchestrator
-```
-
-### Ollama Model Issues
-
-Pull the model manually if needed:
-
-```bash
-docker compose exec ollama ollama pull llama3.1:8b
-```
-
-Reduce model size or use a smaller model:
-
-```env
-# Use smaller model
-MODEL_NAME=meta-llama/Meta-Llama-3.1-8B-Instruct-AWQ
-```
-
-### LLM Not Returning JSON
-
-Some models need fine-tuning prompts. Check `orchestrator/src/prompts.py` and adjust:
-
-```python
-SYSTEM_PROMPT = """You MUST respond with valid JSON only. No markdown, no explanations..."""
-```
-
-### Embedding Search Returns No Results
-
-Check that capabilities are loaded:
-
-```bash
-curl http://localhost:9001/health
-docker compose logs mcp-embed
-```
-
-### Policy Denying Valid Requests
-
-Check OPA logs and policy:
-
-```bash
-docker compose logs mcp-policy
-# Edit mcp/policy/policy.rego
-docker compose restart mcp-policy
-```
-
-## 🛠️ Utilities
-
-### Convert OpenAPI to Capabilities
-
-```bash
-docker compose run --rm orchestrator python -m src.openapi_to_caps \
-  path/to/openapi.yaml \
-  output/capabilities.json
-```
-
-### Rebuild Embeddings Index
-
-```bash
-docker compose restart mcp-embed
-```
-
-The embed server rebuilds its FAISS index from `capabilities.json` on startup.
-
-## 📚 API Reference
-
-### POST /orchestrate
-
-**Request:**
-
-```json
-{
-  "query": "string (required)",
-  "session_id": "string (optional)",
-  "confirmed": "boolean (optional, for high-risk operations)"
-}
-```
-
-**Response:**
-
-```json
-{
-  "decision": "USE_TOOL | ASK_USER | NONE",
-  "tool_used": "string | null",
-  "tool_name": "string | null",
-  "request_payload": "object | null",
-  "api_result": "object | null",
-  "message": "string",
-  "missing_fields": "array | null",
-  "session_id": "string",
-  "confirm_fields": "object | null"
-}
-```
-
-### GET /health
-
-**Response:**
-
-```json
-{
-  "status": "ok",
-  "timestamp": "2026-02-12T14:30:00Z",
-  "services": {
-    "llm": "healthy",
-    "embed": "healthy",
-    "api_tools": "healthy",
-    "policy": "healthy"
-  }
-}
-```
-
-## 🗂️ Project Structure
-
-```
-nl-api-orchestrator/
-├── README.md                          # This file
-├── docker-compose.yml                 # Service orchestration
-├── .env.example                       # Environment template
-├── orchestrator/                      # Main orchestrator service
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   ├── registry/
-│   │   └── capabilities.json          # API capability cards
-│   ├── src/
-│   │   ├── app.py                     # FastAPI application
-│   │   ├── settings.py                # Configuration loader
-│   │   ├── tool_router.py             # Routing logic
-│   │   ├── validators.py              # JSON schema validation
-│   │   ├── normalizers.py             # Payload normalization
-│   │   ├── mcp_client.py              # MCP API tools client
-│   │   ├── opa_client.py              # OPA policy client
-│   │   ├── retriever.py               # RAG capability retrieval
-│   │   ├── openapi_to_caps.py         # OpenAPI converter utility
-│   │   ├── prompts.py                 # LLM prompts
-│   │   └── logging_conf.py            # Structured logging setup
-│   └── tests/
-│       ├── test_orchestrate_happy.py
-│       ├── test_validation.py
-│       └── conftest.py
-├── mcp/                               # MCP-style tool servers
-│   ├── api_tools/                     # Business API executor
-│   │   ├── Dockerfile
-│   │   ├── requirements.txt
-│   │   └── src/
-│   │       ├── server.py
-│   │       └── tools/
-│   │           ├── create_ticket.py
-│   │           ├── list_tickets.py
-│   │           └── __init__.py
-│   ├── embed_tools/                   # Embeddings & vector search
-│   │   ├── Dockerfile
-│   │   ├── requirements.txt
-│   │   └── src/
-│   │       └── server.py
-│   └── policy/                        # OPA policies
-│       └── policy.rego
-├── gateway/                           # Traefik config
-│   └── traefik.yml
-└── ops/                               # Observability configs
-    ├── otelcol-config.yaml
-    ├── prometheus.yml
-    ├── loki-config.yaml
-    ├── promtail-config.yml
-    └── grafana-provisioning/
-        ├── dashboards/
-        │   └── nl-api-overview.json
-        └── datasources/
-            └── datasource.yml
-```
-
-## 📄 License
-
-MIT License - See LICENSE file for details
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass
-5. Submit a pull request
-
-## 💡 Tips
-
-- Start with the default vLLM setup, it's faster than Ollama
-- Add capabilities incrementally and test each one
-- Use `session_id` for multi-turn conversations (future enhancement)
-- Monitor memory usage with `docker stats`
-- Check OPA policies frequently when debugging authorization issues
-
-## 📞 Support
-
-For issues, questions, or contributions, please open an issue on GitHub.
+**38 Documents Organized into 8 Categories**
 
 ---
 
-**Built with ❤️ for agentic AI workflows**
+## 🎯 Quick Start
+
+**New here?** Start with: [`00_START_HERE.md`](00_START_HERE.md)
+
+**Need complete index?** See: [`README_MASTER_INDEX.md`](README_MASTER_INDEX.md)
+
+**Want visual map?** Check: [`CATEGORY_MAP.md`](CATEGORY_MAP.md)
+
+---
+
+## 📂 Documentation Structure
+
+```
+ReadMes/
+│
+├── 🎯 Navigation Documents (Root Level)
+│   ├── 00_START_HERE.md              ← START HERE (Quick navigator)
+│   ├── README_MASTER_INDEX.md        ← Complete index
+│   ├── CATEGORY_MAP.md               ← Visual category map
+│   └── ORGANIZATION_COMPLETE.md      ← Organization summary
+│
+├── 📖 1_Getting_Started/ (5 docs)
+│   ├── README.md
+│   ├── QUICK_START_POC.md           ⭐ Fastest setup
+│   ├── RUN_POC.md
+│   ├── README_POC.md
+│   └── QUICK_REFERENCE.md
+│
+├── 🏗️ 2_Architecture/ (6 docs)
+│   ├── ARCHITECTURE.md              ⭐ Complete architecture
+│   ├── ARCHITECTURE_POC.md
+│   ├── ARCHITECTURE_DIAGRAMS.md
+│   ├── POC_ARCHITECTURE.md
+│   ├── FILE_STRUCTURE_GUIDE.md
+│   └── DOCUMENTATION_INDEX.md
+│
+├── 🗄️ 3_PostgreSQL_Database/ (9 docs)
+│   ├── POSTGRES_COMPLETE_IMPLEMENTATION.md    ⭐ Start here
+│   ├── POSTGRES_DEVICE_RESOLVER.md
+│   ├── QUICK_START_POSTGRES.md
+│   ├── POSTGRES_INTEGRATION_SUMMARY.md
+│   ├── POSTGRES_ARCHITECTURE_DIAGRAMS.md
+│   ├── POSTGRES_QUICK_REFERENCE.md
+│   ├── CACHING_IMPLEMENTATION_COMPLETE.md
+│   ├── DEVICE_RESOLVER_CACHING.md
+│   └── DEVICE_RESOLVER_CACHING_QUICK.md
+│
+├── 🤖 4_Embeddings_RAG/ (4 docs - 80+ pages)
+│   ├── EMBEDDINGS_DOCUMENTATION_INDEX.md      ⭐ Start here
+│   ├── EMBEDDINGS_COMPLETE_GUIDE.md           (50+ pages)
+│   ├── EMBEDDINGS_QUICK_REFERENCE.md
+│   └── EMBEDDINGS_VISUAL_DIAGRAMS.md
+│
+├── 🚀 5_Deployment_Operations/ (6 docs)
+│   ├── BUILD_AND_RUN.md                       ⭐ Build guide
+│   ├── BUILD_OPTIMIZATION.md
+│   ├── BUILD_OPTIMIZATION_SUMMARY.md
+│   ├── MIGRATION_TO_OLLAMA.md
+│   ├── POC_SETUP_COMPLETE.md
+│   └── FINAL_SUMMARY.md
+│
+├── 🎓 6_Interview_Preparation/ (4 docs - 90+ pages)
+│   ├── COMPLETE_INTERVIEW_GUIDE.md            ⭐ Most comprehensive
+│   ├── INTERVIEW_GUIDE_COMPLETE.md
+│   ├── INTERVIEW_GUIDE_RAG_MCP.md
+│   └── INTERVIEW_GUIDE.md
+│
+├── 🐛 7_Troubleshooting/ (3 docs)
+│   ├── OPA_FIX_COMPLETE.md                    ⭐ Complete fix
+│   ├── OPA_FIX_SUMMARY.md
+│   └── RCA_OPA_BOOL_ERROR.md
+│
+└── 📝 8_Contributing/ (1 doc)
+    └── CONTRIBUTING.md
+```
+
+---
+
+## 🔥 Most Important Documents
+
+| Priority | Document | Description |
+|----------|----------|-------------|
+| ⭐⭐⭐⭐⭐ | [`00_START_HERE.md`](00_START_HERE.md) | Quick navigator - **START HERE** |
+| ⭐⭐⭐⭐⭐ | [`1_Getting_Started/QUICK_START_POC.md`](1_Getting_Started/QUICK_START_POC.md) | Fastest way to run system |
+| ⭐⭐⭐⭐⭐ | [`4_Embeddings_RAG/EMBEDDINGS_COMPLETE_GUIDE.md`](4_Embeddings_RAG/EMBEDDINGS_COMPLETE_GUIDE.md) | Complete embeddings guide (50+ pages) |
+| ⭐⭐⭐⭐⭐ | [`3_PostgreSQL_Database/POSTGRES_COMPLETE_IMPLEMENTATION.md`](3_PostgreSQL_Database/POSTGRES_COMPLETE_IMPLEMENTATION.md) | PostgreSQL setup & implementation |
+| ⭐⭐⭐⭐⭐ | [`6_Interview_Preparation/COMPLETE_INTERVIEW_GUIDE.md`](6_Interview_Preparation/COMPLETE_INTERVIEW_GUIDE.md) | Complete interview prep (90+ pages) |
+
+---
+
+## 🎯 Quick Navigation By Goal
+
+| I Want To... | Go To |
+|-------------|-------|
+| 🚀 **Run the system now** | [`1_Getting_Started/QUICK_START_POC.md`](1_Getting_Started/QUICK_START_POC.md) |
+| 📖 **Understand architecture** | [`2_Architecture/ARCHITECTURE_POC.md`](2_Architecture/ARCHITECTURE_POC.md) |
+| 🤖 **Learn about embeddings** | [`4_Embeddings_RAG/EMBEDDINGS_QUICK_REFERENCE.md`](4_Embeddings_RAG/EMBEDDINGS_QUICK_REFERENCE.md) |
+| 🗄️ **Set up PostgreSQL** | [`3_PostgreSQL_Database/QUICK_START_POSTGRES.md`](3_PostgreSQL_Database/QUICK_START_POSTGRES.md) |
+| 🎓 **Prepare for interview** | [`6_Interview_Preparation/COMPLETE_INTERVIEW_GUIDE.md`](6_Interview_Preparation/COMPLETE_INTERVIEW_GUIDE.md) |
+| 🐛 **Fix OPA errors** | [`7_Troubleshooting/OPA_FIX_COMPLETE.md`](7_Troubleshooting/OPA_FIX_COMPLETE.md) |
+| 🔍 **See all documentation** | [`README_MASTER_INDEX.md`](README_MASTER_INDEX.md) |
+
+---
+
+## 📊 Documentation Statistics
+
+```
+Total Documents:        38
+Total Pages:            410+
+Total Categories:       8
+Reading Time:           20+ hours
+
+By Category:
+├─ Getting Started:     5 docs  (13%)
+├─ Architecture:        6 docs  (16%)
+├─ PostgreSQL & DB:     9 docs  (24%) ← Largest
+├─ Embeddings & RAG:    4 docs  (11%)
+├─ Deployment:          6 docs  (16%)
+├─ Interview:           4 docs  (11%)
+├─ Troubleshooting:     3 docs  (8%)
+└─ Contributing:        1 doc   (3%)
+```
+
+---
+
+## 🎓 Learning Paths
+
+### Path A: Quick Start (2 hours) ⚡
+```
+1. 00_START_HERE.md (5 min)
+2. 1_Getting_Started/QUICK_START_POC.md (10 min)
+3. 2_Architecture/ARCHITECTURE_POC.md (30 min)
+4. 4_Embeddings_RAG/EMBEDDINGS_QUICK_REFERENCE.md (30 min)
+5. 3_PostgreSQL_Database/POSTGRES_COMPLETE_IMPLEMENTATION.md (30 min)
+6. Hands-on testing (15 min)
+```
+
+### Path B: Interview Prep (1 day) 🎯
+```
+Morning (4 hours):
+├─ 6_Interview_Preparation/COMPLETE_INTERVIEW_GUIDE.md (2 hours)
+├─ 4_Embeddings_RAG/EMBEDDINGS_QUICK_REFERENCE.md (30 min)
+├─ 3_PostgreSQL_Database/POSTGRES_COMPLETE_IMPLEMENTATION.md (30 min)
+└─ 2_Architecture/ARCHITECTURE_DIAGRAMS.md (30 min)
+
+Afternoon (4 hours):
+├─ Run system + test queries (2 hours)
+├─ Practice explanations (1 hour)
+└─ Demo preparation (1 hour)
+```
+
+### Path C: Deep Learning (1 week) 📚
+```
+Day 1: 1_Getting_Started/ (all 5 docs)
+Day 2: 2_Architecture/ (all 6 docs)
+Day 3: 3_PostgreSQL_Database/ (all 9 docs)
+Day 4: 4_Embeddings_RAG/ (all 4 docs)
+Day 5: 5_Deployment_Operations/ (all 6 docs)
+Day 6: 6_Interview_Preparation/ (all 4 docs)
+Day 7: Hands-on practice + troubleshooting
+```
+
+---
+
+## 🔍 Browse By Category
+
+Click on any category to explore:
+
+- 📖 **[1_Getting_Started/](1_Getting_Started/)** - Setup and basic guides (5 docs)
+- 🏗️ **[2_Architecture/](2_Architecture/)** - System design and structure (6 docs)
+- 🗄️ **[3_PostgreSQL_Database/](3_PostgreSQL_Database/)** - Database and caching (9 docs)
+- 🤖 **[4_Embeddings_RAG/](4_Embeddings_RAG/)** - Vector search and RAG (4 docs, 80+ pages)
+- 🚀 **[5_Deployment_Operations/](5_Deployment_Operations/)** - Build and deploy (6 docs)
+- 🎓 **[6_Interview_Preparation/](6_Interview_Preparation/)** - Interview guides (4 docs, 90+ pages)
+- 🐛 **[7_Troubleshooting/](7_Troubleshooting/)** - Fixes and RCA (3 docs)
+- 📝 **[8_Contributing/](8_Contributing/)** - Development guidelines (1 doc)
+
+---
+
+## 💡 Tips
+
+- **First time here?** Start with [`00_START_HERE.md`](00_START_HERE.md)
+- **Lost?** Check [`README_MASTER_INDEX.md`](README_MASTER_INDEX.md)
+- **Need visual?** See [`CATEGORY_MAP.md`](CATEGORY_MAP.md)
+- **Looking for something specific?** Use the navigation table above
+
+---
+
+## 🎉 Organization Benefits
+
+✅ **8 logical categories** instead of flat structure  
+✅ **Easy navigation** with clear folder names  
+✅ **Quick access** to related documents  
+✅ **Scalable** - easy to add new documents  
+✅ **Searchable** - find documents by topic/category  
+
+---
+
+**Last Updated**: March 2, 2026  
+**Version**: 2.0.0 (Organized Structure)  
+**Status**: ✅ Complete & Production-Ready
+
+---
+
+**Start exploring**: Open [`00_START_HERE.md`](00_START_HERE.md) 🚀
 

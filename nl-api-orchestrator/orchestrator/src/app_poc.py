@@ -7,7 +7,7 @@ Handles natural language queries and orchestrates API execution through RAG, LLM
 import logging
 import uuid
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -20,6 +20,7 @@ from .validators import validate_payload
 from .normalizers import normalize_payload
 from .mcp_client import MCPClient
 from .opa_client import OPAClient
+from .device_resolver import DeviceResolver, ResolutionMode
 
 # Configure logging
 logging.basicConfig(
@@ -55,6 +56,16 @@ class OrchestrationResponse(BaseModel):
     missing_fields: Optional[list] = Field(None, description="List of missing required fields")
     session_id: str = Field(..., description="Session ID for this interaction")
     confirm_fields: Optional[Dict[str, Any]] = Field(None, description="Fields requiring confirmation")
+    # Device resolution — populated when a reference matched multiple devices
+    ambiguous_devices: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Map of ambiguous device reference → list of candidate devices with device_id, displayName, ip, location"
+    )
+    # Device resolution — populated when a reference was fully resolved (for traceability)
+    resolved_devices: Optional[Dict[str, str]] = Field(
+        None,
+        description="Map of original reference → resolved device_id (informational)"
+    )
 
 
 # Initialize components
@@ -62,23 +73,39 @@ retriever: Optional[CapabilityRetriever] = None
 router: Optional[ToolRouter] = None
 mcp_client: Optional[MCPClient] = None
 opa_client: Optional[OPAClient] = None
+device_resolver: Optional[DeviceResolver] = None
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close DB connections cleanly on shutdown."""
+    if device_resolver:
+        await device_resolver.close()
+        logger.info("Device Resolver connection closed.")
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize components on startup."""
-    global retriever, router, mcp_client, opa_client
+    """Initialize all components on startup."""
+    # Declare global variables so we update them instead of creating local ones
+    global retriever, router, mcp_client, opa_client, device_resolver
 
     logger.info("=" * 80)
     logger.info("Starting NMS Credential Management Orchestrator (POC Mode)...")
     logger.info("=" * 80)
-    logger.info(f"LLM Provider : {settings.llm_provider}")
+    logger.info(f"LLM Provider : {settings.llm_provider} (host-installed, not a container)")
+    logger.info(f"Ollama URL   : {settings.openai_base_url}  ← must be running on host")
     logger.info(f"Model        : {settings.model_name}")
     logger.info(f"Embed Server : {settings.embed_server_url}")
     logger.info(f"API Tools    : {settings.api_tools_url}")
     logger.info(f"OPA          : {settings.opa_url}")
     logger.info(f"Registry     : {settings.registry_path}")
     logger.info(f"NLP Metadata : {settings.nlp_metadata_path}")
+    logger.info("=" * 80)
+    logger.info("PRE-REQUISITE: Ollama must be installed on the host and serving.")
+    logger.info("  1. Install : https://ollama.com")
+    logger.info("  2. Start   : ollama serve")
+    logger.info(f"  3. Pull    : ollama pull {settings.model_name}")
     logger.info("=" * 80)
 
     try:
@@ -88,6 +115,7 @@ async def startup_event():
             registry_path=settings.registry_path,
             embed_server_url=settings.embed_server_url
         )
+        logger.info(f"CapabilityRetriever is {retriever}")
         await retriever.initialize()
         logger.info(f"✓ Loaded {len(retriever.capabilities)} capabilities")
 
@@ -98,17 +126,32 @@ async def startup_event():
             openai_api_key=settings.openai_api_key,
             model_name=settings.model_name
         )
+        logger.info(f"router is {router}")
         logger.info("✓ Tool Router initialized")
 
         # Initialize MCP client (Tool execution)
         logger.info("Initializing MCP Client...")
         mcp_client = MCPClient(api_tools_url=settings.api_tools_url)
         logger.info("✓ MCP Client initialized")
+        logger.info(f"mcp_client is {mcp_client}")
 
         # Initialize OPA client (Policy enforcement)
         logger.info("Initializing OPA Client...")
         opa_client = OPAClient(opa_url=settings.opa_url)
-        logger.info("✓ OPA Client initialized")
+        logger.info(f"✓ OPA Client initialized {opa_client}")
+
+        # Initialize Device Resolver (brand/IP/type → device_id)
+        logger.info("Initializing Device Resolver...")
+        device_resolver = DeviceResolver(
+            db_backend   = settings.db_backend,
+            db_url       = settings.db_url,
+            sqlite_path  = settings.sqlite_path,
+            nms_base_url = settings.nms_device_api_url or None,
+            token        = settings.api_token,
+            use_mock     = settings.device_resolver_mock,
+        )
+        await device_resolver.initialize()   # opens DB pool (no-op for mock)
+        logger.info(f"✓ Device Resolver initialized (backend={device_resolver.db_backend})")
 
         logger.info("=" * 80)
         logger.info("✓ All components initialized successfully")
@@ -128,11 +171,21 @@ async def health_check():
         "mode": "POC",
         "services": {}
     }
+    # Log all the component hash code to check it is none
+    logger.info(f"Health Check - Component Status:")
+    logger.info(f"  Router: {router} (id={id(router)})")
+    logger.info(f"  Retriever: {retriever} (id={id(retriever)})")
+    logger.info(f"  MCP Client: {mcp_client} (id={id(mcp_client)})")
+    logger.info(f"  Resolver: {device_resolver} (id={id(device_resolver)})")
+    logger.info(f"  OPA Client: {opa_client} (id={id(opa_client)})")
+    logger.info(f"  Settings: {settings} (id={id(settings)})")
+
 
     # Check LLM
     try:
         if router:
             await router.check_health()
+            logger.info("LLM is healthy")
             health_status["services"]["llm"] = "healthy"
         else:
             health_status["services"]["llm"] = "not_initialized"
@@ -144,6 +197,7 @@ async def health_check():
     try:
         if retriever:
             await retriever.check_health()
+            logger.info("Embed server is healty")
             health_status["services"]["embed"] = "healthy"
         else:
             health_status["services"]["embed"] = "not_initialized"
@@ -155,6 +209,7 @@ async def health_check():
     try:
         if mcp_client:
             await mcp_client.check_health()
+            logger.info("MCP client is healthy")
             health_status["services"]["api_tools"] = "healthy"
         else:
             health_status["services"]["api_tools"] = "not_initialized"
@@ -166,6 +221,7 @@ async def health_check():
     try:
         if opa_client:
             await opa_client.check_health()
+            logger.info("OPA is healthy")
             health_status["services"]["policy"] = "healthy"
         else:
             health_status["services"]["policy"] = "not_initialized"
@@ -173,7 +229,205 @@ async def health_check():
         health_status["services"]["policy"] = f"unhealthy: {str(e)}"
         health_status["status"] = "degraded"
 
+    # Check Device Resolver & Cache
+    try:
+        if device_resolver:
+            cache_stats = device_resolver.get_cache_stats()
+            health_status["services"]["device_resolver"] = {
+                "status": "healthy",
+                "backend": cache_stats["backend"],
+                "cache": {
+                    "total_devices": cache_stats["total_devices"],
+                    "age_seconds": cache_stats["cache_age_seconds"],
+                    "last_refresh": cache_stats["last_refresh"],
+                    "refresh_interval": cache_stats["refresh_interval_seconds"]
+                }
+            }
+            logger.info(f"Device Resolver: {cache_stats['total_devices']} devices cached (age: {cache_stats['cache_age_seconds']}s)")
+        else:
+            health_status["services"]["device_resolver"] = "not_initialized"
+    except Exception as e:
+        health_status["services"]["device_resolver"] = f"unhealthy: {str(e)}"
+        health_status["status"] = "degraded"
+
     return health_status
+
+
+async def _resolve_device_references(
+    tool_name: str,
+    payload: dict,
+    session_id: str,
+    mode: ResolutionMode = ResolutionMode.NORMAL,
+) -> tuple:
+    """
+    Step 2.5 - Resolve human-readable device references to actual NMS device_ids.
+
+    Fields examined:
+      Scalar : source, deviceId
+      List   : destinations, deviceIds, deleteDevIds
+
+    Resolution behaviour per mode:
+      NORMAL   single match → replace silently
+               multiple matches → ASK_USER with disambiguation list
+               no match → ASK_USER asking for correct device
+      ALL      multiple matches → expand ALL device_ids automatically (no ask)
+               e.g. "trust all scalance" → [SCALANCE-X200-001, SCALANCE-X200-002, SCALANCE-XC200-001]
+      ANY_ONE  multiple matches → pick FIRST device_id automatically (no ask)
+               e.g. "copy from any ruggedcom" → RUGGEDCOM-RS900-001
+
+    Returns:
+        (resolved_payload, ask_user_dict_or_None, resolved_map)
+        ask_user_dict is None when resolution succeeded without needing user input.
+        resolved_map = { original_ref → resolved_device_id } for traceability.
+    """
+    if not device_resolver:
+        return payload, None, {}
+
+    SCALAR_FIELDS = ["source", "deviceId"]
+    LIST_FIELDS   = ["destinations", "deviceIds", "deleteDevIds"]
+
+    updated      = dict(payload)
+    ambiguous_map = {}  # ref -> [candidates]  (only populated in NORMAL mode)
+    unresolved    = []
+    resolved_map  = {}  # original_ref -> resolved_device_id
+
+    def _apply(field: str, ref: str, matches: List[Dict[str, Any]]) -> Optional[List[str]]:
+        """
+        Decide what to do with matches for a single reference.
+        Returns list of resolved device_ids, or None if unresolved.
+        Also populates ambiguous_map when mode=NORMAL and multiple matches exist.
+        """
+        if not matches:
+            return None  # unresolved
+
+        if len(matches) == 1:
+            return [matches[0]["device_id"]]
+
+        # Multiple matches
+        if mode == ResolutionMode.ALL:
+            ids = [m["device_id"] for m in matches]
+            logger.info(f"[{session_id}] ALL mode: '{ref}' → expanded to {ids}")
+            return ids
+
+        if mode == ResolutionMode.ANY_ONE:
+            chosen = matches[0]["device_id"]
+            logger.info(f"[{session_id}] ANY_ONE mode: '{ref}' → picked '{chosen}' from {len(matches)} matches")
+            return [chosen]
+
+        # NORMAL mode — flag as ambiguous, caller will ask user
+        ambiguous_map[ref] = matches
+        return None  # signals ambiguous
+
+    # ── Scalar fields ─────────────────────────────────────────────────────────
+    for field in SCALAR_FIELDS:
+        ref = updated.get(field)
+        if not ref or not isinstance(ref, str):
+            continue
+        matches = await device_resolver.resolve(ref, mode)
+        resolved_ids = _apply(field, ref, matches)
+
+        if resolved_ids is None and ref not in ambiguous_map:
+            unresolved.append(ref)
+        elif resolved_ids:
+            if mode == ResolutionMode.ALL and len(resolved_ids) > 1:
+                # Scalar field can't hold multiple — promote to list field if possible
+                # For "source" there's no natural list equivalent; just use first and warn
+                # For "deviceId" we could promote to deviceIds — handled below
+                if field == "deviceId":
+                    updated.pop("deviceId", None)
+                    updated["deviceIds"] = resolved_ids
+                    for rid in resolved_ids:
+                        resolved_map[ref] = resolved_ids  # map to list
+                    logger.info(f"[{session_id}] Promoted deviceId → deviceIds: {resolved_ids}")
+                else:
+                    # source field — use first device and log a note
+                    updated[field] = resolved_ids[0]
+                    resolved_map[ref] = resolved_ids[0]
+                    logger.warning(
+                        f"[{session_id}] ALL mode on scalar field '{field}': "
+                        f"using first match '{resolved_ids[0]}' (consider using a list field)"
+                    )
+            else:
+                # Single resolved id (or ANY_ONE first pick)
+                updated[field] = resolved_ids[0]
+                if ref != resolved_ids[0]:
+                    resolved_map[ref] = resolved_ids[0]
+                    logger.info(f"[{session_id}] Resolved '{ref}' → '{resolved_ids[0]}' (field={field})")
+
+    # ── List fields ───────────────────────────────────────────────────────────
+    for field in LIST_FIELDS:
+        refs = updated.get(field)
+        if not refs or not isinstance(refs, list):
+            continue
+        resolved_list = []
+        for ref in refs:
+            matches    = await device_resolver.resolve(ref, mode)
+            resolved_ids = _apply(field, ref, matches)
+
+            if resolved_ids is None and ref not in ambiguous_map:
+                unresolved.append(ref)
+                resolved_list.append(ref)       # keep original so validation catches it
+            elif resolved_ids:
+                resolved_list.extend(resolved_ids)  # ALL → multiple IDs flattened into list
+                if ref != resolved_ids[0]:
+                    resolved_map[ref] = resolved_ids if len(resolved_ids) > 1 else resolved_ids[0]
+                    logger.info(f"[{session_id}] Resolved '{ref}' → {resolved_ids} (field={field})")
+            else:
+                resolved_list.append(ref)       # ambiguous — keep original
+
+        updated[field] = resolved_list
+
+    # ── Ambiguous (NORMAL mode only) ──────────────────────────────────────────
+    if ambiguous_map:
+        choices_msg = []
+        for ref, candidates in ambiguous_map.items():
+            options = ", ".join(
+                f"{c['device_id']} ({c.get('display_name', c.get('displayName', ''))}"
+                f" IP={c['ip']} Loc={c.get('location', '')})"
+                for c in candidates
+            )
+            choices_msg.append(f"'{ref}' matched {len(candidates)} devices: [{options}]")
+
+        message = (
+            "I found multiple devices matching your reference(s). "
+            "Please specify the exact device ID, or rephrase using 'all' or 'any':\n"
+            + "\n".join(choices_msg)
+        )
+        logger.info(f"[{session_id}] Ambiguous references (NORMAL mode): {list(ambiguous_map.keys())}")
+        return updated, {
+            "decision": "ASK_USER",
+            "tool_name": tool_name,
+            "message": message,
+            "missing_fields": [f"exact device_id for: {ref}" for ref in ambiguous_map],
+            "ambiguous_devices": {
+                ref: [
+                    {
+                        "device_id":    c["device_id"],
+                        "display_name": c.get("display_name", c.get("displayName", "")),
+                        "ip":           c["ip"],
+                        "location":     c.get("location", ""),
+                    }
+                    for c in candidates
+                ]
+                for ref, candidates in ambiguous_map.items()
+            },
+        }, resolved_map
+
+    # ── Unresolved ────────────────────────────────────────────────────────────
+    if unresolved:
+        message = (
+            f"I could not find the following device(s): {', '.join(unresolved)}. "
+            "Please provide a valid device ID, IP address, or exact device name."
+        )
+        logger.warning(f"[{session_id}] Unresolved device references: {unresolved}")
+        return updated, {
+            "decision": "ASK_USER",
+            "tool_name": tool_name,
+            "message": message,
+            "missing_fields": [f"valid device ID for: {ref}" for ref in unresolved],
+        }, resolved_map
+
+    return updated, None, resolved_map
 
 
 def _build_nms_message(tool_name: str, payload: dict, api_result: dict, notes: str) -> str:
@@ -331,6 +585,28 @@ async def orchestrate(request: OrchestrationRequest):
                 detail=f"LLM selected unknown tool: {tool_name}"
             )
 
+        # Step 2.5: Device Resolution — translate brand/IP/type → real device_ids
+        # Detect ALL / ANY_ONE intent from the original query BEFORE LLM extraction
+        resolution_mode = device_resolver.detect_resolution_mode(request.query) if device_resolver else ResolutionMode.NORMAL
+        logger.info(f"[{session_id}] Step 2.5: Resolving device references (mode={resolution_mode.value})...")
+        payload, ask_response, resolved_map = await _resolve_device_references(
+            tool_name, payload, session_id, resolution_mode
+        )
+        if ask_response:
+            # Ambiguous (multiple matches in NORMAL mode) or unresolved → ask user
+            return OrchestrationResponse(
+                decision=ask_response["decision"],
+                tool_name=ask_response["tool_name"],
+                missing_fields=ask_response.get("missing_fields"),
+                message=ask_response["message"],
+                confirm_fields=ask_response.get("ambiguous_devices"),
+                ambiguous_devices=ask_response.get("ambiguous_devices"),
+                session_id=session_id,
+            )
+        if resolved_map:
+            logger.info(f"[{session_id}] → Device resolution map: {resolved_map}")
+        logger.info(f"[{session_id}] → Resolved payload: {payload}")
+
         # Step 3: Validate payload
         logger.info(f"[{session_id}] Step 3: Validating payload...")
         is_valid, validation_error = validate_payload(
@@ -409,6 +685,7 @@ async def orchestrate(request: OrchestrationRequest):
             request_payload=payload,
             api_result=api_result,
             message=message,
+            resolved_devices=resolved_map if resolved_map else None,
             session_id=session_id
         )
 

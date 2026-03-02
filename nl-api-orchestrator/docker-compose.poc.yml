@@ -2,13 +2,21 @@
 # MINIMAL POC DOCKER COMPOSE - Fast startup, essential services only
 # =============================================================================
 # This is a simplified version with:
-# - Ollama LLM (local model)
 # - Orchestrator (main service)
 # - MCP API Tools (tool execution)
 # - MCP Embed (RAG embeddings)
 # - OPA Policy (security)
 #
+# OLLAMA runs on the HOST machine (not inside Docker).
+# Install from https://ollama.com  then run:
+#   ollama serve                        # starts on localhost:11434
+#   ollama pull llama3.1:8b             # download the model once
+#
+# The orchestrator calls Ollama via host.docker.internal:11434
+# (Docker Desktop resolves this automatically on Windows/macOS)
+#
 # REMOVED for POC:
+# - Ollama container (use host-installed Ollama instead – saves ~4 GB image)
 # - Traefik (use direct connections)
 # - OpenTelemetry/Jaeger (no tracing)
 # - Prometheus (no metrics)
@@ -17,6 +25,31 @@
 # =============================================================================
 
 services:
+  # =============================================================================
+  # PostgreSQL Database - Device Registry
+  # Stores NMS device metadata (device_id, IP, type, brand, model, location)
+  # Uses official PostgreSQL 15 image (~150 MB compressed)
+  # =============================================================================
+  postgres:
+    image: postgres:15-alpine  # Lightweight Alpine-based PostgreSQL
+    environment:
+      POSTGRES_USER: nms_user
+      POSTGRES_PASSWORD: nms_password
+      POSTGRES_DB: nms_devices
+    ports:
+      - "5432:5432"  # Expose for external tools (pgAdmin, psql, etc.)
+    volumes:
+      - postgres-data:/var/lib/postgresql/data  # Persist data across restarts
+      - ./orchestrator/scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nms_user -d nms_devices"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - nl-api-net
+
   # =============================================================================
   # Main Orchestrator Service - Core brain of the system
   # =============================================================================
@@ -29,8 +62,12 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - LLM_PROVIDER=ollama
-      - LLM_BASE_URL=http://ollama:11434
-      - MODEL_NAME=llama3.1:8b
+      # host.docker.internal resolves to the Windows/macOS host from inside a container.
+      # Ollama must be running on the host: `ollama serve`
+      # OPENAI_BASE_URL maps to settings.openai_base_url (pydantic-settings field name)
+      - OPENAI_BASE_URL=http://host.docker.internal:11434/v1
+      - OPENAI_API_KEY=ollama
+      - MODEL_NAME=llama3.2:3b
       - EMBED_SERVER_URL=http://mcp-embed:9001
       - API_TOOLS_URL=http://mcp-api:9000
       - OPA_URL=http://mcp-policy:8181/v1/data/policy
@@ -41,14 +78,21 @@ services:
       - LOG_LEVEL=INFO
       - ENABLE_TRACING=false
       - ENABLE_METRICS=false
+      # Device Resolution Backend (postgres | sqlite | mock)
+      - DB_BACKEND=postgres
+      - DB_URL=postgresql://nms_user:nms_password@postgres:5432/nms_devices
+      # For SQLite backend (alternative): DB_BACKEND=sqlite, SQLITE_PATH=/data/devices.db
     volumes:
       - ./orchestrator/registry:/app/registry:ro
       - ./orchestrator/src:/app/src:ro
     depends_on:
-      - ollama
+      - postgres
       - mcp-embed
       - mcp-api
       - mcp-policy
+    # Allow orchestrator container to reach the host's Ollama service
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
@@ -59,68 +103,37 @@ services:
       - nl-api-net
 
   # =============================================================================
-  # Ollama - Local LLM Server
-  # Fast startup, manages models automatically
-  # =============================================================================
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama-data:/root/.ollama
-    environment:
-      - OLLAMA_HOST=0.0.0.0
-    # GPU support (comment out if no GPU available - will use CPU)
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    networks:
-      - nl-api-net
-
-  # =============================================================================
   # MCP Embeddings Server - RAG capability matching
-  # Generates embeddings for semantic search
-  # OPTIMIZED: CPU-only PyTorch, pre-downloaded model
-  # Build time: ~3min first time, ~30sec rebuilds (with cache)
-  # Image size: ~1.5-2GB (vs 4GB+ with CUDA)
+  # Generates embeddings for semantic search via fastembed (ONNX, no PyTorch)
+  # Build time: < 2 min  |  Image size: ~600 MB
+  #
+  # MODEL DOWNLOAD: happens on FIRST container start (not at build time).
+  #   ~120 MB ONNX file stored in the embed-cache volume → instant on restart.
   # =============================================================================
   mcp-embed:
     build:
       context: ./mcp/embed_tools
-      dockerfile: Dockerfile.fast  # CPU-only, optimized for size and speed
+      dockerfile: Dockerfile.fast
     ports:
       - "9001:9001"
     environment:
       - EMBED_MODEL=BAAI/bge-small-en-v1.5
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
-      # Registry directory containing ALL three JSON data sources:
-      #   credential_api_schema_rag.json          (API schemas)
-      #   credential_api_nlp_metadata.json        (intent patterns, synonyms, training samples)
-      #   credential_api_rag_training_examples.json (real user query examples)
+      # FASTEMBED_CACHE_PATH must match the volume mount below
+      - FASTEMBED_CACHE_PATH=/app/model_cache
+      # Registry directory containing all three JSON data sources
       - REGISTRY_DIR=/app/registry
-      # Disable unnecessary logging for faster startup
-      - TRANSFORMERS_VERBOSITY=error
-      - TOKENIZERS_PARALLELISM=false
     volumes:
-      - ./orchestrator/registry:/app/registry:ro  # mounts all three JSON files
-      - embed-cache:/root/.cache  # Persists model cache across restarts
+      - ./orchestrator/registry:/app/registry:ro   # all three JSON files (read-only)
+      - embed-cache:/app/model_cache               # persists ONNX model across restarts
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 60s
+      retries: 5
+      # First start: allow time for model download (~120 MB, 1-3 min on slow connection)
+      start_period: 180s
     networks:
       - nl-api-net
 
@@ -190,6 +203,7 @@ networks:
 # Persistent Storage
 # =============================================================================
 volumes:
-  ollama-data:     # Stores downloaded LLM models
+  postgres-data:   # Stores PostgreSQL device registry
   embed-cache:     # Caches embedding models
+  # NOTE: Ollama model storage is managed by the host-installed Ollama (~/.ollama)
 

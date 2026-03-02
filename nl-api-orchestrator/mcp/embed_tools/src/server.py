@@ -1,6 +1,11 @@
 """
 MCP Embeddings & Vector Search Server.
-Provides embedding and similarity search using SentenceTransformers and FAISS.
+Provides embedding and similarity search using fastembed (ONNX) and FAISS.
+
+fastembed replaces sentence-transformers + PyTorch:
+  • No 187 MB PyTorch wheel download → no build timeout
+  • ONNX Runtime CPU inference, ~600 MB image (vs ~2 GB)
+  • Same model: BAAI/bge-small-en-v1.5
 
 Embedding text is enriched from THREE sources:
   1. credential_api_schema_rag.json    – API name, description, examples
@@ -16,7 +21,13 @@ from typing import List, Dict
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
+
+# FASTEMBED_CACHE_PATH must be set BEFORE importing fastembed so the library
+# picks up the correct cache directory (set via Docker env / entrypoint).
+_cache_path = os.getenv("FASTEMBED_CACHE_PATH", "/app/model_cache")
+os.environ.setdefault("FASTEMBED_CACHE_PATH", _cache_path)
+
+from fastembed import TextEmbedding   # replaces SentenceTransformer (no PyTorch)
 import faiss
 
 logging.basicConfig(level=logging.INFO)
@@ -38,8 +49,8 @@ NLP_METADATA_PATH  = os.path.join(REGISTRY_DIR, "credential_api_nlp_metadata.jso
 TRAINING_EX_PATH   = os.path.join(REGISTRY_DIR, "credential_api_rag_training_examples.json")
 
 # ── Global state ───────────────────────────────────────────────────────────────
-model: SentenceTransformer = None
-index: faiss.Index          = None
+model: TextEmbedding    = None   # fastembed model (ONNX, no PyTorch)
+index: faiss.Index      = None
 capability_ids:   List[str] = []
 capability_texts: List[str] = []
 
@@ -253,8 +264,8 @@ async def startup_event():
     global model, index, capability_ids, capability_texts
 
     # ── Load model ─────────────────────────────────────────────────────────────
-    logger.info(f"Loading embedding model: {EMBED_MODEL}")
-    model = SentenceTransformer(EMBED_MODEL)
+    logger.info(f"Loading embedding model via fastembed (ONNX): {EMBED_MODEL}")
+    model = TextEmbedding(EMBED_MODEL)   # reads from FASTEMBED_CACHE_PATH
     logger.info("Model loaded successfully")
 
     # ── Load all registry files ────────────────────────────────────────────────
@@ -310,8 +321,8 @@ async def startup_event():
 
     # ── Generate embeddings ────────────────────────────────────────────────────
     logger.info(f"Generating embeddings for {len(capability_texts)} capabilities …")
-    embeddings = model.encode(capability_texts, show_progress_bar=False)
-    embeddings = np.array(embeddings, dtype="float32")
+    # fastembed.embed() returns a generator of numpy arrays (one per text)
+    embeddings = np.array(list(model.embed(capability_texts)), dtype="float32")
 
     # ── Build FAISS index (cosine similarity via inner product on L2-normalised vecs)
     dimension = embeddings.shape[1]
@@ -346,7 +357,8 @@ async def embed_text(request: EmbedRequest):
         raise HTTPException(status_code=503, detail="Model not initialized")
     try:
         logger.info(f"Embedding: {request.text[:100]}…")
-        embedding = model.encode([request.text], show_progress_bar=False)[0]
+        # fastembed.query_embed() is optimised for single query strings
+        embedding = next(model.query_embed([request.text]))
         return EmbedResponse(vector=embedding.tolist())
     except Exception as e:
         logger.error(f"Embedding failed: {e}", exc_info=True)

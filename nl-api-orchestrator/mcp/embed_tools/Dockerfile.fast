@@ -1,42 +1,46 @@
+﻿# =============================================================================
+# FAST DOCKERFILE - ONNX-based embeddings via fastembed (NO PyTorch)
+#
+# WHY fastembed instead of sentence-transformers + PyTorch?
+#   - No 187 MB torch wheel -> no pip read-timeout during build
+#   - Uses ONNX Runtime CPU -> fast inference, small footprint
+#   - Supports BAAI/bge-small-en-v1.5 natively
+#   - Build time: < 2 min  |  Image size: ~600 MB (vs ~2 GB with PyTorch)
+#
+# MODEL DOWNLOAD STRATEGY:
+#   We do NOT download the model at build time. Docker build environments
+#   often have restricted/slow network access which causes download failures.
+#   Instead the entrypoint.sh script downloads the model on FIRST RUN and
+#   caches it in the embed-cache Docker volume so subsequent starts are
+#   instant (no re-download needed).
+#
+# Build:   docker build -f Dockerfile.fast -t mcp-embed .
+# Run:     docker compose -f docker-compose.poc.yml up
 # =============================================================================
-# FAST DOCKERFILE - CPU-only version (much smaller than CUDA)
-# Size: ~2GB (vs 4GB+ for CUDA version)
-# =============================================================================
-
-# Use Python slim base with CPU-only PyTorch
-FROM python:3.10-slim
-
+FROM python:3.11-slim
 WORKDIR /app
-
-# Install system dependencies
+# Minimal OS deps: curl (healthcheck only)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Python packages with CPU-only PyTorch
+# Install Python packages - NO torch, NO sentence-transformers
+# fastembed bundles onnxruntime-cpu; model downloaded at runtime via entrypoint
 RUN pip install --no-cache-dir \
-    torch==2.2.0 --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir \
     fastapi==0.109.0 \
-    uvicorn[standard]==0.27.0 \
+    "uvicorn[standard]==0.27.0" \
     pydantic==2.5.3 \
-    sentence-transformers==2.5.1 \
+    fastembed==0.2.6 \
     faiss-cpu==1.7.4 \
     numpy==1.26.3
-
-# Pre-download model during build (cached in image layer)
-ENV TRANSFORMERS_CACHE=/app/model_cache
-ENV SENTENCE_TRANSFORMERS_HOME=/app/model_cache
-RUN python -c "from sentence_transformers import SentenceTransformer; print('Downloading model...'); SentenceTransformer('BAAI/bge-small-en-v1.5'); print('Model cached!')"
-
-
-# Copy application code
+# Model cache lives in a named Docker volume so it persists across restarts.
+# FASTEMBED_CACHE_PATH tells fastembed where to store/find ONNX model files.
+ENV FASTEMBED_CACHE_PATH=/app/model_cache
+# Copy startup entrypoint and application code
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 COPY src/ /app/src/
-
 EXPOSE 9001
-
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --retries=5 \
     CMD curl -f http://localhost:9001/health || exit 1
-
-CMD ["uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "9001"]
-
+# entrypoint.sh downloads the model on first run (skips if cached), then starts uvicorn
+ENTRYPOINT ["/app/entrypoint.sh"]
